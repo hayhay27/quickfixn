@@ -2,6 +2,9 @@
 using System.Linq;
 using System.Net;
 using System;
+using System.Threading;
+using QuickFix.Internal;
+using System.Collections.Concurrent;
 
 namespace QuickFix
 {
@@ -9,17 +12,14 @@ namespace QuickFix
     /// Acceptor implementation - with threads
     /// Creates a ThreadedSocketReactor for every listening endpoint.
     /// </summary>
-    public class ThreadedSocketAcceptor : IAcceptor
+    public class ThreadedSocketAcceptor : Disposable, IAcceptor
     {
-        
-
         private Dictionary<SessionID, Session> sessions_ = new Dictionary<SessionID, Session>();
         private SessionSettings settings_;
-        private Dictionary<IPEndPoint, AcceptorSocketDescriptor> socketDescriptorForAddress_ = new Dictionary<IPEndPoint, AcceptorSocketDescriptor>();
+        private ConcurrentDictionary<IPEndPoint, AcceptorSocketDescriptor> socketDescriptorForAddress_ = new ConcurrentDictionary<IPEndPoint, AcceptorSocketDescriptor>();
         private SessionFactory sessionFactory_;
-        private bool isStarted_ = false;
-        private bool _disposed = false;
-        private object sync_ = new object();
+        private int _started;
+        private object _sync = new object();
 
         #region Constructors
 
@@ -112,7 +112,7 @@ namespace QuickFix
             IPEndPoint socketEndPoint;
             if (dict.Has(SessionSettings.SOCKET_ACCEPT_HOST))
             {
-                string host = dict.GetString(SessionSettings.SOCKET_ACCEPT_HOST);                
+                string host = dict.GetString(SessionSettings.SOCKET_ACCEPT_HOST);
                 IPAddress[] addrs = Dns.GetHostAddresses(host);
                 socketEndPoint = new IPEndPoint(addrs[0], port);
                 // Set hostname (if it is not already configured)
@@ -124,16 +124,8 @@ namespace QuickFix
             }
 
             socketSettings.Configure(dict);
-            
 
-            AcceptorSocketDescriptor descriptor;
-            if (!socketDescriptorForAddress_.TryGetValue(socketEndPoint, out descriptor))
-            {
-                descriptor = new AcceptorSocketDescriptor(socketEndPoint, socketSettings, dict);
-                socketDescriptorForAddress_[socketEndPoint] = descriptor;
-            }
-
-            return descriptor;
+            return socketDescriptorForAddress_.GetOrAdd(socketEndPoint, ep => new AcceptorSocketDescriptor(ep, socketSettings, dict));
         }
 
         /// <summary>
@@ -161,10 +153,10 @@ namespace QuickFix
 
         private void StartAcceptingConnections()
         {
-            lock (sync_)
+            lock (_sync)
             {
                 // FIXME StartSessionTimer();
-                foreach (AcceptorSocketDescriptor socketDescriptor in socketDescriptorForAddress_.Values)
+                foreach (var socketDescriptor in socketDescriptorForAddress_.Values)
                 {
                     socketDescriptor.SocketReactor.Start();
                     // FIXME log_.Info("Listening for connections on " + socketDescriptor.getAddress());
@@ -174,9 +166,9 @@ namespace QuickFix
 
         private void StopAcceptingConnections()
         {
-            lock (sync_)
+            lock (_sync)
             {
-                foreach (AcceptorSocketDescriptor socketDescriptor in socketDescriptorForAddress_.Values)
+                foreach (var socketDescriptor in socketDescriptorForAddress_.Values)
                 {
                     socketDescriptor.SocketReactor.Shutdown();
                     // FIXME log_.Info("No longer accepting connections on " + socketDescriptor.getAddress());
@@ -268,17 +260,12 @@ namespace QuickFix
 
         public void Start()
         {
-            if (_disposed)
-                throw new ObjectDisposedException(GetType().Name);
+            ThrowIfDisposed();
 
-            lock (sync_)
-            {
-                if (!isStarted_)
-                {
-                    StartAcceptingConnections();
-                    isStarted_ = true;
-                }
-            }
+            if (Interlocked.CompareExchange(ref _started, 1, 0) != 0)
+                return;
+
+            StartAcceptingConnections();
         }
 
         public void Stop()
@@ -288,16 +275,22 @@ namespace QuickFix
 
         public void Stop(bool force)
         {
-            if (_disposed)
-                throw new ObjectDisposedException(GetType().Name);
+            ThrowIfDisposed();
+            StopCore(force);
 
+            // FIXME StopSessionTimer();
+            // FIXME Session.UnregisterSessions(GetSessions());
+        }
+
+        private void StopCore(bool force)
+        {
+            if (Interlocked.CompareExchange(ref _started, 0, 1) != 1)
+                return;
+            
             StopAcceptingConnections();
             LogoutAllSessions(force);
             DisposeSessions();
             sessions_.Clear();
-
-            // FIXME StopSessionTimer();
-            // FIXME Session.UnregisterSessions(GetSessions());
         }
 
         /// <summary>
@@ -367,7 +360,8 @@ namespace QuickFix
                 if (session.IsLoggedOn && !terminateActiveSession)
                     return false;
                 session.Disconnect("Dynamic session removal");
-                foreach (AcceptorSocketDescriptor descriptor in socketDescriptorForAddress_.Values)
+
+                foreach (var descriptor in socketDescriptorForAddress_.Values)
                     if (descriptor.RemoveSession(sessionID))
                         break;
                 sessions_.Remove(sessionID);
@@ -381,32 +375,18 @@ namespace QuickFix
         #endregion
 
         /// <summary>
-        /// Any subclasses of ThreadedSocketAcceptor should override this if they have resources to dispose
-        /// Any override should call base.Dispose(disposing).
-        /// </summary>
-        /// <param name="disposing"></param>
-        protected virtual void Dispose(bool disposing)
-        {
-            try
-            {
-                Stop();
-                _disposed = true;
-            }
-            catch (ObjectDisposedException)
-            {
-                // ignore
-            }
-        }
-
-        /// <summary>
         /// Disposes created sessions
         /// </summary>
         /// <remarks>
         /// To simply stop the acceptor without disposing sessions, use Stop() or Stop(bool)
         /// </remarks>
-        public void Dispose()
+        protected override void DisposeCore()
         {
-            Stop();
+            StopCore(false);
+            foreach (var descriptor in socketDescriptorForAddress_.Values)
+            {
+                descriptor.Dispose();
+            }
         }
     }
 }

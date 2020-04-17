@@ -1,37 +1,30 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using QuickFix.Internal;
 
 namespace QuickFix
 {
-    internal class AcceptorSocketDescriptor
+    internal class AcceptorSocketDescriptor : Disposable
     {
         #region Properties
 
-        public ThreadedSocketReactor SocketReactor
-        {
-            get { return socketReactor_; }
-        }
+        public ThreadedSocketReactor SocketReactor { get; }
 
-        public IPEndPoint Address
-        {
-            get { return socketEndPoint_; }
-        }
+        public IPEndPoint Address { get; }
 
         #endregion
 
         #region Private Members
 
-        private ThreadedSocketReactor socketReactor_;
-        private IPEndPoint socketEndPoint_;
-        private Dictionary<SessionID, Session> acceptedSessions_ = new Dictionary<SessionID, Session>();
+        private readonly Dictionary<SessionID, Session> acceptedSessions_ = new Dictionary<SessionID, Session>();
 
         #endregion
 
         public AcceptorSocketDescriptor(IPEndPoint socketEndPoint, SocketSettings socketSettings, QuickFix.Dictionary sessionDict)
         {
-            socketEndPoint_ = socketEndPoint;
-            socketReactor_ = new ThreadedSocketReactor(socketEndPoint_, socketSettings, sessionDict, this);
+            Address = socketEndPoint;
+            SocketReactor = new ThreadedSocketReactor(Address, socketSettings, sessionDict, this);
         }
 
         public void AcceptSession(Session session)
@@ -61,6 +54,11 @@ namespace QuickFix
             {
                 return new Dictionary<SessionID, Session>(acceptedSessions_);
             }
+        }
+
+        protected override void DisposeCore()
+        {
+            SocketReactor.Dispose();
         }
     }
 }
